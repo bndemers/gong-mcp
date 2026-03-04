@@ -61,6 +61,81 @@ interface GongRetrieveTranscriptsResponse {
   transcripts: GongTranscript[];
 }
 
+interface GongCallExtensive {
+  metaData: {
+    id: string;
+    url?: string;
+    title?: string;
+    scheduled?: string;
+    started?: string;
+    duration?: number;
+    primaryUserId?: string;
+    direction?: string;
+    system?: string;
+    scope?: string;
+    media?: string;
+    language?: string;
+    purpose?: string;
+    isPrivate?: boolean;
+  };
+  parties?: Array<{
+    id?: string;
+    emailAddress?: string;
+    name?: string;
+    title?: string;
+    userId?: string;
+    speakerId?: string;
+    affiliation?: string;
+  }>;
+  content?: {
+    structure?: Array<{ name: string; duration: number }>;
+    topics?: Array<{ name: string; duration?: number }>;
+    trackers?: Array<{ id?: string; name: string; count?: number; occurrences?: Array<unknown> }>;
+    brief?: string;
+    outline?: Array<{ section: string; startTime?: number; duration?: number; items?: Array<{ text: string }> }>;
+    highlights?: Array<{ title: string; items: Array<{ text?: string }> }>;
+    callOutcome?: { id: string; category: string; name: string };
+    keyPoints?: Array<{ text: string }>;
+  };
+  interaction?: {
+    speakers?: Array<{ id: string; userId?: string; talkTime?: number }>;
+    questions?: {
+      companyCount?: number;
+      nonCompanyCount?: number;
+    };
+    personInteractionStats?: Array<{
+      speakerId?: string;
+      talkTime?: number;
+    }>;
+  };
+  collaboration?: {
+    publicComments?: Array<{
+      id?: string;
+      commenterUserId?: string;
+      comment?: string;
+      commentTime?: string;
+      duringCall?: boolean;
+    }>;
+  };
+}
+
+interface GongCallsExtensiveResponse {
+  requestId: string;
+  records: {
+    totalRecords: number;
+    currentPageSize: number;
+    currentPageNumber: number;
+    cursor?: string;
+  };
+  calls: GongCallExtensive[];
+}
+
+interface GongCallsExtensiveArgs {
+  callIds?: string[];
+  fromDateTime?: string;
+  toDateTime?: string;
+}
+
 interface GongListCallsArgs {
   [key: string]: string | undefined;
   fromDateTime?: string;
@@ -143,6 +218,41 @@ class GongClient {
       }
     });
   }
+
+  async getCallDetails(args: GongCallsExtensiveArgs): Promise<GongCallsExtensiveResponse> {
+    const filter: Record<string, unknown> = {};
+    if (args.callIds) filter.callIds = args.callIds;
+    if (args.fromDateTime) filter.fromDateTime = args.fromDateTime;
+    if (args.toDateTime) filter.toDateTime = args.toDateTime;
+
+    return this.request<GongCallsExtensiveResponse>('POST', '/calls/extensive', undefined, {
+      filter,
+      contentSelector: {
+        context: "Extended",
+        exposedFields: {
+          content: {
+            brief: true,
+            outline: true,
+            highlights: true,
+            keyPoints: true,
+            topics: true,
+            trackers: true,
+            callOutcome: true,
+            structure: true,
+          },
+          interaction: {
+            personInteractionStats: true,
+            questions: true,
+            speakers: true,
+          },
+          collaboration: {
+            publicComments: true,
+          },
+          parties: true,
+        },
+      },
+    });
+  }
 }
 
 const gongClient = new GongClient(GONG_ACCESS_KEY, GONG_ACCESS_SECRET);
@@ -150,7 +260,7 @@ const gongClient = new GongClient(GONG_ACCESS_KEY, GONG_ACCESS_SECRET);
 // Tool definitions
 const LIST_CALLS_TOOL: Tool = {
   name: "list_calls",
-  description: "List Gong calls with optional date range filtering. Returns call details including ID, title, start/end times, participants, and duration.",
+  description: "List Gong calls with optional date range filtering. Returns call details including ID, title, start/end times, participants, and duration. Use this first to discover calls, then use get_call_details to get summaries.",
   inputSchema: {
     type: "object",
     properties: {
@@ -166,9 +276,32 @@ const LIST_CALLS_TOOL: Tool = {
   }
 };
 
+const GET_CALL_DETAILS_TOOL: Tool = {
+  name: "get_call_details",
+  description: "Retrieve detailed call data including AI-generated brief, outline, key points, highlights, topics, call outcome, trackers, participant info, and interaction stats. Use this to understand what a call was about WITHOUT fetching the full transcript. Prefer this over retrieve_transcripts unless you need exact quotes or the full verbatim conversation.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      callIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "Array of Gong call IDs to retrieve details for"
+      },
+      fromDateTime: {
+        type: "string",
+        description: "Start date/time in ISO format (e.g. 2024-03-01T00:00:00Z). Used when filtering by date range instead of call IDs."
+      },
+      toDateTime: {
+        type: "string",
+        description: "End date/time in ISO format (e.g. 2024-03-31T23:59:59Z). Used when filtering by date range instead of call IDs."
+      }
+    }
+  }
+};
+
 const RETRIEVE_TRANSCRIPTS_TOOL: Tool = {
   name: "retrieve_transcripts",
-  description: "Retrieve transcripts for specified call IDs. Returns detailed transcripts including speaker IDs, topics, and timestamped sentences.",
+  description: "Retrieve the full verbatim transcript for specified call IDs. Returns detailed transcripts including speaker IDs, topics, and timestamped sentences. This returns a large amount of data - prefer get_call_details first for summaries, and only use this when you need exact quotes or the full conversation text.",
   inputSchema: {
     type: "object",
     properties: {
@@ -205,6 +338,15 @@ function isGongListCallsArgs(args: unknown): args is GongListCallsArgs {
   );
 }
 
+function isGongCallsExtensiveArgs(args: unknown): args is GongCallsExtensiveArgs {
+  if (typeof args !== "object" || args === null) return false;
+  const a = args as Record<string, unknown>;
+  if ("callIds" in a && (!Array.isArray(a.callIds) || !a.callIds.every(id => typeof id === "string"))) return false;
+  if ("fromDateTime" in a && typeof a.fromDateTime !== "string") return false;
+  if ("toDateTime" in a && typeof a.toDateTime !== "string") return false;
+  return true;
+}
+
 function isGongRetrieveTranscriptsArgs(args: unknown): args is GongRetrieveTranscriptsArgs {
   return (
     typeof args === "object" &&
@@ -217,7 +359,7 @@ function isGongRetrieveTranscriptsArgs(args: unknown): args is GongRetrieveTrans
 
 // Tool handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [LIST_CALLS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
+  tools: [LIST_CALLS_TOOL, GET_CALL_DETAILS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name: string; arguments?: unknown } }) => {
@@ -239,6 +381,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name
           content: [{ 
             type: "text", 
             text: JSON.stringify(response, null, 2)
+          }],
+          isError: false,
+        };
+      }
+
+      case "get_call_details": {
+        if (!isGongCallsExtensiveArgs(args)) {
+          throw new Error("Invalid arguments for get_call_details");
+        }
+        const detailsResponse = await gongClient.getCallDetails(args);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(detailsResponse, null, 2)
           }],
           isError: false,
         };
