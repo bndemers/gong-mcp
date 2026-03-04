@@ -130,10 +130,19 @@ interface GongCallsExtensiveResponse {
   calls: GongCallExtensive[];
 }
 
+const ContentSelector = {
+  SUMMARY: "summary",
+  DETAILED: "detailed",
+  FULL: "full",
+} as const;
+
+type ContentSelectorPreset = typeof ContentSelector[keyof typeof ContentSelector];
+
 interface GongCallsExtensiveArgs {
   callIds?: string[];
   fromDateTime?: string;
   toDateTime?: string;
+  contentSelector?: ContentSelectorPreset;
 }
 
 interface GongListCallsArgs {
@@ -219,7 +228,7 @@ class GongClient {
     });
   }
 
-  async getCallDetails(args: GongCallsExtensiveArgs): Promise<GongCallsExtensiveResponse> {
+  async getCallDetails(args: GongCallsExtensiveArgs, preset: ContentSelectorPreset): Promise<GongCallsExtensiveResponse> {
     const filter: Record<string, unknown> = {};
     if (args.callIds) filter.callIds = args.callIds;
     if (args.fromDateTime) filter.fromDateTime = args.fromDateTime;
@@ -227,35 +236,53 @@ class GongClient {
 
     return this.request<GongCallsExtensiveResponse>('POST', '/calls/extensive', undefined, {
       filter,
-      contentSelector: {
-        context: "Extended",
-        exposedFields: {
-          content: {
-            brief: true,
-            outline: true,
-            highlights: true,
-            keyPoints: true,
-            topics: true,
-            trackers: true,
-            callOutcome: true,
-            structure: true,
-          },
-          interaction: {
-            personInteractionStats: true,
-            questions: true,
-            speakers: true,
-          },
-          collaboration: {
-            publicComments: true,
-          },
-          parties: true,
-        },
-      },
+      contentSelector: buildContentSelector(preset),
     });
   }
 }
 
 const gongClient = new GongClient(GONG_ACCESS_KEY, GONG_ACCESS_SECRET);
+
+// Build Gong API contentSelector based on detail level preset
+function buildContentSelector(preset: ContentSelectorPreset): Record<string, unknown> {
+  const content: Record<string, boolean> = {
+    brief: true,
+    keyPoints: true,
+    highlights: true,
+    topics: true,
+    callOutcome: true,
+  };
+
+  if (preset === ContentSelector.DETAILED || preset === ContentSelector.FULL) {
+    content.outline = true;
+    content.structure = true;
+  }
+
+  if (preset === ContentSelector.FULL) {
+    content.trackers = true;
+  }
+
+  const selector: Record<string, unknown> = {
+    context: preset === ContentSelector.FULL ? "Extended" : "None",
+    exposedFields: {
+      parties: true,
+      content,
+    },
+  };
+
+  if (preset === ContentSelector.DETAILED || preset === ContentSelector.FULL) {
+    (selector.exposedFields as Record<string, unknown>).interaction = {
+      personInteractionStats: true,
+      questions: true,
+      speakers: true,
+    };
+    (selector.exposedFields as Record<string, unknown>).collaboration = {
+      publicComments: true,
+    };
+  }
+
+  return selector;
+}
 
 // Tool definitions
 const LIST_CALLS_TOOL: Tool = {
@@ -278,7 +305,7 @@ const LIST_CALLS_TOOL: Tool = {
 
 const GET_CALL_DETAILS_TOOL: Tool = {
   name: "get_call_details",
-  description: "Retrieve detailed call data including AI-generated brief, outline, key points, highlights, topics, call outcome, trackers, participant info, and interaction stats. Use this to understand what a call was about WITHOUT fetching the full transcript. Prefer this over retrieve_transcripts unless you need exact quotes or the full verbatim conversation.",
+  description: "Retrieve detailed call data including AI-generated brief, key points, highlights, topics, call outcome, trackers, participant info, and interaction stats. Use this to understand what a call was about WITHOUT fetching the full transcript. Prefer this over retrieve_transcripts unless you need exact quotes or the full verbatim conversation. Defaults to \"summary\" contentSelector which returns brief, key points, highlights, and topics (~84% fewer tokens). Use \"detailed\" to add the full outline, or \"full\" for everything including CRM context and trackers.",
   inputSchema: {
     type: "object",
     properties: {
@@ -294,6 +321,11 @@ const GET_CALL_DETAILS_TOOL: Tool = {
       toDateTime: {
         type: "string",
         description: "End date/time in ISO format (e.g. 2024-03-31T23:59:59Z). Used when filtering by date range instead of call IDs."
+      },
+      contentSelector: {
+        type: "string",
+        enum: ["summary", "detailed", "full"],
+        description: "Controls response detail level. \"summary\" (default): brief + keyPoints + highlights + topics + parties (no CRM context). ~84% smaller. \"detailed\": summary + outline (no CRM context, no trackers). \"full\": everything (current behavior)."
       }
     }
   }
@@ -338,12 +370,15 @@ function isGongListCallsArgs(args: unknown): args is GongListCallsArgs {
   );
 }
 
+const VALID_CONTENT_SELECTORS = Object.values(ContentSelector);
+
 function isGongCallsExtensiveArgs(args: unknown): args is GongCallsExtensiveArgs {
   if (typeof args !== "object" || args === null) return false;
   const a = args as Record<string, unknown>;
   if ("callIds" in a && (!Array.isArray(a.callIds) || !a.callIds.every(id => typeof id === "string"))) return false;
   if ("fromDateTime" in a && typeof a.fromDateTime !== "string") return false;
   if ("toDateTime" in a && typeof a.toDateTime !== "string") return false;
+  if ("contentSelector" in a && (typeof a.contentSelector !== "string" || !VALID_CONTENT_SELECTORS.includes(a.contentSelector as ContentSelectorPreset))) return false;
   return true;
 }
 
@@ -390,7 +425,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name
         if (!isGongCallsExtensiveArgs(args)) {
           throw new Error("Invalid arguments for get_call_details");
         }
-        const detailsResponse = await gongClient.getCallDetails(args);
+        const preset = args.contentSelector ?? ContentSelector.SUMMARY;
+        const detailsResponse = await gongClient.getCallDetails(args, preset);
         return {
           content: [{
             type: "text",
