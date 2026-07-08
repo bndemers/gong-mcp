@@ -2,6 +2,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -10,24 +11,63 @@ import {
 import axios from 'axios';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
-
-// Redirect all console output to stderr
-const originalConsole = { ...console };
-console.log = (...args) => originalConsole.error(...args);
-console.info = (...args) => originalConsole.error(...args);
-console.warn = (...args) => originalConsole.error(...args);
+import express from 'express';
 
 dotenv.config();
 
-const GONG_API_URL = process.env.GONG_API_URL + '/v2';
+// In stdio mode, stdout is reserved for JSON-RPC frames — redirect console output to stderr
+// so stray logs don't corrupt the protocol. In HTTP mode we want normal stdout logging.
+const isStdioMode = !process.env.PORT;
+if (isStdioMode) {
+  const originalConsole = { ...console };
+  console.log = (...args) => originalConsole.error(...args);
+  console.info = (...args) => originalConsole.error(...args);
+  console.warn = (...args) => originalConsole.error(...args);
+}
+
+const GONG_API_URL = `${process.env.GONG_API_URL}/v2`;
 const GONG_ACCESS_KEY = process.env.GONG_ACCESS_KEY;
 const GONG_ACCESS_SECRET = process.env.GONG_ACCESS_SECRET;
 
-// Check for required environment variables
-if (!GONG_ACCESS_KEY || !GONG_ACCESS_SECRET) {
-  console.error("Error: GONG_ACCESS_KEY and GONG_ACCESS_SECRET environment variables are required");
+if (!GONG_ACCESS_KEY || !GONG_ACCESS_SECRET || !process.env.GONG_API_URL) {
+  console.error("Error: GONG_ACCESS_KEY, GONG_ACCESS_SECRET, and GONG_API_URL environment variables are required");
   process.exit(1);
 }
+
+// MCP_AUTH_TOKENS is a JSON map from bearer token → user label, e.g. {"tok_abc123":"alice"}.
+// Rotating one entry revokes that teammate without disrupting anyone else.
+function loadAuthTokens(): Map<string, string> {
+  const raw = process.env.MCP_AUTH_TOKENS;
+  if (!raw) {
+    console.error("Error: MCP_AUTH_TOKENS is required in HTTP mode. Set it to a JSON object mapping token → user label, e.g. {\"tok_abc\":\"alice\"}");
+    process.exit(1);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error("Error: MCP_AUTH_TOKENS must be valid JSON (a JSON object mapping token → user label)");
+    process.exit(1);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    console.error("Error: MCP_AUTH_TOKENS must be a JSON object mapping token → user label");
+    process.exit(1);
+  }
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length === 0) {
+    console.error("Error: MCP_AUTH_TOKENS is empty; add at least one token → user entry");
+    process.exit(1);
+  }
+  for (const [token, user] of entries) {
+    if (!token || typeof user !== "string" || !user) {
+      console.error("Error: MCP_AUTH_TOKENS entries must be non-empty string → non-empty string");
+      process.exit(1);
+    }
+  }
+  return new Map(entries as [string, string][]);
+}
+
+const AUTH_TOKENS = isStdioMode ? new Map<string, string>() : loadAuthTokens();
 
 // Type definitions
 interface GongCall {
@@ -53,7 +93,20 @@ interface GongTranscript {
   }>;
 }
 
+interface GongListCallsPageResponse {
+  requestId: string;
+  records: {
+    totalRecords: number;
+    currentPageSize: number;
+    currentPageNumber: number;
+    cursor?: string;
+  };
+  calls: GongCall[];
+}
+
 interface GongListCallsResponse {
+  totalRecords: number;
+  truncated: boolean;
   calls: GongCall[];
 }
 
@@ -155,6 +208,13 @@ interface GongRetrieveTranscriptsArgs {
   callIds: string[];
 }
 
+const MAX_LIST_CALLS = 500;
+const PAGINATION_DELAY_MS = 350; // ~3 req/sec rate limit
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // Gong API Client
 class GongClient {
   private accessKey: string;
@@ -189,24 +249,38 @@ class GongClient {
   }
 
   private async request<T>(method: string, path: string, params?: Record<string, string | undefined>, data?: Record<string, unknown>): Promise<T> {
-    const timestamp = new Date().toISOString();
-    const url = `${GONG_API_URL}${path}`;
-    
-    const response = await axios({
-      method,
-      url,
-      params,
-      data,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(`${this.accessKey}:${this.accessSecret}`).toString('base64')}`,
-        'X-Gong-AccessKey': this.accessKey,
-        'X-Gong-Timestamp': timestamp,
-        'X-Gong-Signature': await this.generateSignature(method, path, timestamp, data || params)
-      }
-    });
+    const maxRetries = 3;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const timestamp = new Date().toISOString();
+      const url = `${GONG_API_URL}${path}`;
 
-    return response.data as T;
+      try {
+        const response = await axios({
+          method,
+          url,
+          params,
+          data,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Basic ${Buffer.from(`${this.accessKey}:${this.accessSecret}`).toString('base64')}`,
+            'X-Gong-AccessKey': this.accessKey,
+            'X-Gong-Timestamp': timestamp,
+            'X-Gong-Signature': await this.generateSignature(method, path, timestamp, data || params)
+          }
+        });
+
+        return response.data as T;
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 429 && attempt < maxRetries) {
+          const retryAfter = parseInt(error.response.headers['retry-after'] ?? '5', 10);
+          console.warn(`Rate limited (429). Retrying after ${retryAfter}s (attempt ${attempt + 1}/${maxRetries})`);
+          await delay(retryAfter * 1000);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error('Max retries exceeded');
   }
 
   async listCalls(fromDateTime?: string, toDateTime?: string): Promise<GongListCallsResponse> {
@@ -214,7 +288,27 @@ class GongClient {
     if (fromDateTime) params.fromDateTime = fromDateTime;
     if (toDateTime) params.toDateTime = toDateTime;
 
-    return this.request<GongListCallsResponse>('GET', '/calls', params);
+    const allCalls: GongCall[] = [];
+    let totalRecords = 0;
+
+    // First page uses date filters
+    let page = await this.request<GongListCallsPageResponse>('GET', '/calls', params);
+    allCalls.push(...page.calls);
+    totalRecords = page.records.totalRecords;
+
+    // Follow cursor for subsequent pages
+    while (page.records.cursor && allCalls.length < MAX_LIST_CALLS) {
+      await delay(PAGINATION_DELAY_MS);
+      page = await this.request<GongListCallsPageResponse>('GET', '/calls', { cursor: page.records.cursor });
+      allCalls.push(...page.calls);
+    }
+
+    const truncated = allCalls.length > MAX_LIST_CALLS;
+    return {
+      totalRecords,
+      truncated,
+      calls: truncated ? allCalls.slice(0, MAX_LIST_CALLS) : allCalls,
+    };
   }
 
   async retrieveTranscripts(callIds: string[]): Promise<GongRetrieveTranscriptsResponse> {
@@ -348,17 +442,6 @@ const RETRIEVE_TRANSCRIPTS_TOOL: Tool = {
 };
 
 // Server implementation
-const server = new Server(
-  {
-    name: "example-servers/gong",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
-);
 
 // Type guards
 function isGongListCallsArgs(args: unknown): args is GongListCallsArgs {
@@ -392,90 +475,158 @@ function isGongRetrieveTranscriptsArgs(args: unknown): args is GongRetrieveTrans
   );
 }
 
-// Tool handlers
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [LIST_CALLS_TOOL, GET_CALL_DETAILS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
-}));
+function createServer(): Server {
+  const server = new Server(
+    {
+      name: "confido-gong",
+      title: "Gong (Confido)",
+      version: "0.1.0",
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    },
+  );
 
-server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name: string; arguments?: unknown } }) => {
-  try {
-    const { name, arguments: args } = request.params;
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [LIST_CALLS_TOOL, GET_CALL_DETAILS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
+  }));
 
-    if (!args) {
-      throw new Error("No arguments provided");
-    }
+  server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name: string; arguments?: unknown } }) => {
+    try {
+      const { name, arguments: args } = request.params;
 
-    switch (name) {
-      case "list_calls": {
-        if (!isGongListCallsArgs(args)) {
-          throw new Error("Invalid arguments for list_calls");
-        }
-        const { fromDateTime, toDateTime } = args;
-        const response = await gongClient.listCalls(fromDateTime, toDateTime);
-        return {
-          content: [{ 
-            type: "text", 
-            text: JSON.stringify(response, null, 2)
-          }],
-          isError: false,
-        };
+      if (!args) {
+        throw new Error("No arguments provided");
       }
 
-      case "get_call_details": {
-        if (!isGongCallsExtensiveArgs(args)) {
-          throw new Error("Invalid arguments for get_call_details");
+      switch (name) {
+        case "list_calls": {
+          if (!isGongListCallsArgs(args)) {
+            throw new Error("Invalid arguments for list_calls");
+          }
+          const { fromDateTime, toDateTime } = args;
+          const response = await gongClient.listCalls(fromDateTime, toDateTime);
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(response, null, 2)
+            }],
+            isError: false,
+          };
         }
-        const preset = args.contentSelector ?? ContentSelector.SUMMARY;
-        const detailsResponse = await gongClient.getCallDetails(args, preset);
-        return {
-          content: [{
+
+        case "get_call_details": {
+          if (!isGongCallsExtensiveArgs(args)) {
+            throw new Error("Invalid arguments for get_call_details");
+          }
+          const preset = args.contentSelector ?? ContentSelector.SUMMARY;
+          const detailsResponse = await gongClient.getCallDetails(args, preset);
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(detailsResponse, null, 2)
+            }],
+            isError: false,
+          };
+        }
+
+        case "retrieve_transcripts": {
+          if (!isGongRetrieveTranscriptsArgs(args)) {
+            throw new Error("Invalid arguments for retrieve_transcripts");
+          }
+          const { callIds } = args;
+          const response = await gongClient.retrieveTranscripts(callIds);
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(response, null, 2)
+            }],
+            isError: false,
+          };
+        }
+
+        default:
+          return {
+            content: [{ type: "text", text: `Unknown tool: ${name}` }],
+            isError: true,
+          };
+      }
+    } catch (error) {
+      return {
+        content: [
+          {
             type: "text",
-            text: JSON.stringify(detailsResponse, null, 2)
-          }],
-          isError: false,
-        };
-      }
-
-      case "retrieve_transcripts": {
-        if (!isGongRetrieveTranscriptsArgs(args)) {
-          throw new Error("Invalid arguments for retrieve_transcripts");
-        }
-        const { callIds } = args;
-        const response = await gongClient.retrieveTranscripts(callIds);
-        return {
-          content: [{ 
-            type: "text", 
-            text: JSON.stringify(response, null, 2)
-          }],
-          isError: false,
-        };
-      }
-
-      default:
-        return {
-          content: [{ type: "text", text: `Unknown tool: ${name}` }],
-          isError: true,
-        };
+            text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
     }
-  } catch (error) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-        },
-      ],
-      isError: true,
-    };
-  }
-});
+  });
 
-async function runServer() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
 }
 
-runServer().catch((error) => {
+async function runStdio() {
+  const transport = new StdioServerTransport();
+  await createServer().connect(transport);
+}
+
+async function runHttp() {
+  const app = express();
+  app.use(express.json());
+
+  app.get("/health", (_req, res) => {
+    res.type("text/plain").send("ok");
+  });
+
+  app.post("/mcp", async (req, res) => {
+    const authHeader = req.headers.authorization ?? "";
+    const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    const user = bearer ? AUTH_TOKENS.get(bearer) : undefined;
+    if (!user) {
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Unauthorized" },
+        id: null,
+      });
+      return;
+    }
+    const method = typeof req.body?.method === "string" ? req.body.method : "?";
+    console.log(`[${user}] ${method}`);
+
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
+    }
+  });
+
+  const port = Number(process.env.PORT);
+  app.listen(port, "0.0.0.0", () => {
+    console.log(`Gong MCP HTTP server listening on :${port}`);
+  });
+}
+
+const run = isStdioMode ? runStdio : runHttp;
+run().catch((error) => {
   console.error("Fatal error running server:", error);
   process.exit(1);
-}); 
+});
