@@ -1,18 +1,12 @@
-FROM node:18-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
+RUN npm ci
 
-# Install dependencies
-RUN npm install 2>&1
-
-# Copy source code
 COPY . .
+RUN npm run build
 
-# Build TypeScript code
-RUN npm run build 2>&1
-
-# Start the server
-CMD ["sh", "-c", "node dist/index.js 2>&1"] 
+EXPOSE 3000
+CMD ["node", "dist/index.js"]

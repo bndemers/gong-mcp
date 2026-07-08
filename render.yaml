@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: gong-mcp
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GONG_ACCESS_KEY
+        sync: false
+      - key: GONG_ACCESS_SECRET
+        sync: false
+      - key: GONG_API_URL
+        sync: false
+      - key: MCP_AUTH_TOKENS
+        sync: false
