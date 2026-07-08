@@ -2,7 +2,7 @@ services:
   - type: web
     name: gong-mcp
     runtime: docker
-    plan: hobby
+    plan: free
     healthCheckPath: /health
     autoDeploy: true
     envVars:
