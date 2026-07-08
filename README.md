@@ -22,14 +22,33 @@ If Confido's server is already deployed, you just need:
 - The server URL — ask an admin (looks like `https://<name>.onrender.com/mcp`)
 - Your personal bearer token — ask an admin (they'll issue one just for you)
 
-Add a remote MCP connector in your client:
+Add a remote MCP connector in your client. The exact shape depends on which client you use — Claude Desktop's config file is stdio-only and needs a bridge, while Claude Code speaks HTTP natively.
 
-**Claude Desktop / Claude Code:**
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS): use [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) as a stdio↔HTTP proxy. Claude Desktop launches it via `npx`; first run downloads it (a few seconds), then it's cached.
 
 ```json
 {
   "mcpServers": {
-    "gong": {
+    "confido-gong": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://<name>.onrender.com/mcp",
+        "--header",
+        "Authorization: Bearer <your-token>"
+      ]
+    }
+  }
+}
+```
+
+**Claude Code** (`.mcp.json` in your project, or `~/.claude.json`): speaks HTTP directly, no bridge needed.
+
+```json
+{
+  "mcpServers": {
+    "confido-gong": {
       "type": "http",
       "url": "https://<name>.onrender.com/mcp",
       "headers": {
@@ -42,7 +61,30 @@ Add a remote MCP connector in your client:
 
 **claude.ai:** add a custom connector in Settings → Connectors, paste the URL, add the header `Authorization: Bearer <your-token>`.
 
-Keep your token secret — it identifies you in the server's request logs and gives access to Confido's Gong data. If it leaks, ask an admin to rotate it.
+Restart your client after editing the config. Keep your token secret — it identifies you in the server's request logs and gives access to Confido's Gong data. If it leaks, ask an admin to rotate it.
+
+<details>
+<summary>Optional: keep the token out of process args (Claude Desktop)</summary>
+
+`mcp-remote` expands `${VAR}` in headers, so you can move the token into an `env` block. The file stays plaintext either way — the only real gain is that `ps aux` no longer shows the token in the process listing.
+
+```json
+"confido-gong": {
+  "command": "npx",
+  "args": [
+    "-y",
+    "mcp-remote",
+    "https://<name>.onrender.com/mcp",
+    "--header",
+    "Authorization: Bearer ${AUTH_TOKEN}"
+  ],
+  "env": {
+    "AUTH_TOKEN": "<your-token>"
+  }
+}
+```
+
+</details>
 
 ## Running Locally (Development)
 
