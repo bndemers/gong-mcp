@@ -1,5 +1,9 @@
 # Gong MCP Server
 
+> **⚠️ Deprecated.** Confido no longer uses Gong, the Gong API credentials no longer work, and the hosted server has been shut down. This repo is kept for reference only.
+>
+> **Use [Attention](https://docs.attention.com/mcp/overview) instead.** It has a first-party MCP connection, so no custom server is needed. In Claude, go to **Settings → Connectors**, search for **Attention** (or add a custom connector with `https://api.attention.tech/mcp`), and click **Connect**. Claude Code picks up connectors added in claude.ai automatically.
+
 A Model Context Protocol (MCP) server that exposes Gong's call data (metadata, AI-generated summaries, and transcripts) to Claude and other MCP clients.
 
 Can run two ways:
